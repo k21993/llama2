@@ -52,15 +52,42 @@ def apply_rotary_embeddings(x: torch.Tensor,
                             device:str
                             ):
     
+    #x is the token already divided by num heads for multi-headed self attention.
     #transform x: [x1, x2, x3, x4] -> [[x1, x2], [x3, x4]] -> [x1 + ix2, x3+ix4]
-    #shape: (B, seq_len, H, head_dim/2)
+    #shape: (B, seq_len, H, head_dim) -> (B, seq_len, H, head_dim/2)
     x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1],-1,2))
     #(seq_len, head_dim/2) -> (1, seq_len, 1, head_dim/2): add batch and head dim
     freqs_complex = freqs_complex.unsqueeze(0).unsqueeze(2)
-    #element-wise multiplcation rotates x
-    #shape: (B, seq_len,H,head_dim/2)
+    #element-wise multiplication with freqs_complex rotates x
+    #shape: (B, seq_len,H,head_dim/2) * (1, seq_len, 1, head_dim/2) -> (B, seq_len, H, head_dim/2)
     x_rotated = x_complex * freqs_complex
+    #[x1+ix2, x3+ix4] -> [[x1,x2],[x3,x4]]
+    #(B, seq_len, H, head_dim/2) -> (B, seq_len, H, head_dim/2, 2)
+    x_out = torch.view_as_real(x_rotated)
+    #(B, seq_len, H, head_dim/2, 2) -> (B, seq_len, H, head_dim)
+    x_out = x_out.reshape(*x.shape)
     
+    return x_out.type_as(x).to(device)
+    
+class RMSNorm(nn.Module):
+    """
+    rms_norm(x) = x/sqrt(mean(xi**2))
+    """
+    def __init__(self, dim: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.eps = eps
+        #gamma param in RMS norm
+        self.weight = nn.Parameter(torch.ones(dim))
+        
+    def _norm(self, x:torch.Tensor):
+        #(B, seq_len, dim)
+        #rqsrt = 1/(sqrt(x))
+        return x*torch.rqsrt(x.pow(2).mean(-1, keepdim=True)+ self.eps)
+    
+    def forward(self, x:torch.Tensor)-> torch.Tensor:
+        #(dim) * (B, seq_len, dim) -> (B, seq_len, dim)
+        return self.weight * self._norm(x.float()).type_as(x)
+        
 class Transformer(nn.Module):
     """
     A class the implements the entire model architecture:
