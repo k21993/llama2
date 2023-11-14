@@ -68,10 +68,23 @@ def apply_rotary_embeddings(x: torch.Tensor,
     x_out = x_out.reshape(*x.shape)
     
     return x_out.type_as(x).to(device)
-    
+
+def repeat_kv(x:torch.Tensor, n_rep:int) -> torch.Tensor:
+    batch_size, seq_len, n_kv_heads, head_dim = x.shape
+    if n_rep == 1:
+        return x
+    else:
+        return(
+            #(B, seq_len, n_kv_heads, 1, head_dim)
+            x[:, :, :, None, :]
+            .expand(batch_size, seq_len, n_kv_heads, n_rep, head_dim) #make num kv heads = num q heads
+            .reshape(batch_size, seq_len, n_kv_heads*n_rep, head_dim) #flatten
+        )
+        
 class RMSNorm(nn.Module):
     """
-    rms_norm(x) = x/sqrt(mean(xi**2))
+    rms_norm(x) = gamma * x/sqrt(mean(xi**2))
+    where gamma is a learnable param which controls the amount of re-scaling invariance.
     """
     def __init__(self, dim: int, eps: float = 1e-6) -> None:
         super().__init__()
@@ -87,6 +100,110 @@ class RMSNorm(nn.Module):
     def forward(self, x:torch.Tensor)-> torch.Tensor:
         #(dim) * (B, seq_len, dim) -> (B, seq_len, dim)
         return self.weight * self._norm(x.float()).type_as(x)
+
+class SelfAttention(nn.Module):
+    
+    def __init__(self, args:ModelArgs):
+        super().__init__()
+        
+        #number of heads for the Key and Values
+        self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
+        #number of heads for Queries
+        self.n_q_heads = args.n_heads
+        #ratio of number of heads of Queries to number of KV heads (number of times KV heads must be repeated to get Q heads)
+        self.n_rep = self.n_q_heads // self.n_kv_heads
+        #dimension of each head in multi-head self attention.
+        self.head_dim = args.dim // args.n_heads
+        
+        #input token has size dim, output query token has n_head different representations and each has size head_dim
+        self.wq = nn.Linear(args.dim, args.n_q_heads*self.head_dim, bias=False)
+        #input token has size dim, output key token has n_kv_heads (<=n_heads) rep and each has size head_dim
+        self.wk = nn.Linear(args.dim, args.n_kv_heads*self.head_dim, bias=False)
+        #input token has size dim, output value token has n_kv_heads rep and each of these has size head_dim
+        self.wv = nn.Linear(args.dim, args.n_kv_heads*self.head_dim, bias=False)
+        #input token is the output of attention and has size of (n_heads, head_dim)
+        #output token expected size is: (dim)
+        self.wo = nn.Linear(args.n_heads*self.head_dim, args.dim, bias=False)
+        
+        #KV cache
+        self.cache_k = torch.zeros(args.max_batch_size, args.max_seq_len, self.n_kv_heads, self.head_dim)
+        self.cache_v = torch.zeros(args.max_batch_size, args.max_seq_len, self.n_kv_heads, self.head_dim)
+    
+    def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: torch.Tensor):
+        batch_size, seq_len, _ = x.shape() #(B, 1, dim)
+        
+        #multiply the input emb with WQ, WK, WV to get Q, K, V.
+        #(B, 1, dim) -> (B, 1, H_Q*head_dim)
+        xq = self.wq(x)
+        #(B, 1, dim) -> (B,1, H_KV*head_dim)
+        xk = self.wk(x)
+        #(B, 1, dim) -> (B, 1, H_KV*head_dim)
+        xv = self.wv(x)
+        
+        #(B, 1, HQ*head_dim) -> (B, 1, HQ, head_dim)
+        xq = xq.view(batch_size, seq_len, self.n_q_heads, self.head_dim)
+        #(B, 1, HKV*head_dim) -> (B, 1, HKV, head_dim)
+        xk = xk.view(batch_size, seq_len, self.n_kv_heads, self.head_dim)
+        #(B, 1, HKV*head_dim) -> (B, 1, HKV, head_dim)
+        xv = xv.view(batch_size, seq_len, n_kv_heads, self.head_dim)
+        
+        #apply RoPE to Q, K only. (output is same size as input)
+        xq = apply_rotary_embeddings(xq, freqs_complex, device=x.device)
+        xk = apply_rotary_embeddings(xk, freqs_complex, device=x.device)
+        
+        #replace the entry in the KV cache for this token
+        self.cache_k[:batch_size, start_pos:start_pos+seq_len] = xk
+        self.cache_v[:batch_size, start_pos:start_pos+seq_len] = xv
+        
+        #retreive all cached keys and values so far for attention calculation
+        #(B, Seq_Len_KV, H_KV, Head_Dim)
+        keys = self.cache_k[:batch_size,0:start_pos+seq_len] #?
+        values = self.values_k[:batch_size,0:start_pos+seq_len] #?
+        
+        #repeat the heads of K and V to equal number of queries (not-optimal)
+        keys = repeat_kv(keys, self.n_rep)
+        values = repeat_kv(values, self.n_rep)
+        
+        #multi-head attention
+        #(B, 1, H_Q, Head_Dim) --> (B, H_Q, 1, Head_Dim)
+        xq = xq.transpose(1, 2)
+        keys = keys.transpose(1, 2)
+        values = values.transpose(1, 2)
+        
+        #(B, H_Q, 1, Head_Dim) @ (B, H_Q, Head_Dim, Seq_Len_KV) --> (B, HQ, 1, Seq_Len_KV)
+        scores = torch.matmul(xq, keys.transpose(2,3)) / math.sqrt(self.head_dim)
+        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+        
+        #(B, HQ, 1, Seq_Len_KV) @(B, HQ, Seq_Len_KV, Head_Dim) --> (B, HQ, 1, Head_Dim)
+        output = torch.matmul(scores, values)
+        output = output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+        output = self.wo(output)
+        
+        return output
+    
+class EncoderBlock(nn.Module):
+    
+    def __init__(self, args: ModelArgs) -> None:
+        super().__init__()
+        self.n_heads = args.n_heads
+        self.dim = args.dim
+        self.head_dim = args.dim // args.n_heads
+        
+        #normalization before attention
+        self.attention_norm = RMSNorm(args.dim, eps=args.eps)
+        #self attention block
+        self.attention = SelfAttention(args)
+        #normalization before the feedforward block
+        self.ffn_norm = RMSNorm(args.dim, eps=args.eps)
+        #feed forward block
+        self.feed_forward = FeedForward(args)
+        
+    def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: torch.Tensor) -> torch.Tensor:
+        #(B, seq_len, dim) + (B, seq_len, dim) --> (B, seq_len, dim)
+        h = x + self.attention.forward(self.attention_norm(x), start_pos, freqs_complex)
+        out = h + self.feed_forward(self.ffn_norm(h))
+        
+        return out
         
 class Transformer(nn.Module):
     """
@@ -138,5 +255,3 @@ class Transformer(nn.Module):
         output = self.output(h).float() #why .float()?
 
         return output
-    
-
