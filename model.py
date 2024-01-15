@@ -70,6 +70,11 @@ def apply_rotary_embeddings(x: torch.Tensor,
     return x_out.type_as(x).to(device)
 
 def repeat_kv(x:torch.Tensor, n_rep:int) -> torch.Tensor:
+    """
+    Repeats the KV heads (n_kv_heads) to match the query heads (n_heads).
+    This is done in order to simplify the matrix multiplication process here,
+    its not optimal. 
+    """
     batch_size, seq_len, n_kv_heads, head_dim = x.shape
     if n_rep == 1:
         return x
@@ -155,10 +160,10 @@ class SelfAttention(nn.Module):
         self.cache_k[:batch_size, start_pos:start_pos+seq_len] = xk
         self.cache_v[:batch_size, start_pos:start_pos+seq_len] = xv
         
-        #retreive all cached keys and values so far for attention calculation
+        #retrieve all cached keys and values so far for attention calculation
         #(B, Seq_Len_KV, H_KV, Head_Dim)
-        keys = self.cache_k[:batch_size,0:start_pos+seq_len] #?
-        values = self.values_k[:batch_size,0:start_pos+seq_len] #?
+        keys = self.cache_k[:batch_size,0:start_pos+seq_len] #can't this just be keys = self.cache_k?
+        values = self.values_k[:batch_size,0:start_pos+seq_len]
         
         #repeat the heads of K and V to equal number of queries (not-optimal)
         keys = repeat_kv(keys, self.n_rep)
@@ -176,11 +181,36 @@ class SelfAttention(nn.Module):
         
         #(B, HQ, 1, Seq_Len_KV) @(B, HQ, Seq_Len_KV, Head_Dim) --> (B, HQ, 1, Head_Dim)
         output = torch.matmul(scores, values)
+        # (B, HQ, 1, Head_Dim) -> (B, 1, HQ, Head_Dim) -> (B, 1, dim)
         output = output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
-        output = self.wo(output)
+        output = self.wo(output) #(B,1,Dim) -> (B, 1, dim)
         
         return output
     
+class FeedForward(nn.Module):
+    
+    def __init__(self, args.ModelArgs):
+        super.__init__()
+        hidden_dim = 4 * args.dim
+        hidden_dim = int(2*hidden_dim/3) #8*dim/3 ?
+        if args.ffn_dim_multiplier is not None:
+            hidden_dim = int(args.ffn_dim_multiplier * hidden_dim)
+        
+        #round up the hidden dim to the nearest multiple of multiple_of param
+        hidden_dim = args.multiple_of * ((hidden_dim + args.multiple_of -1) // args.multiple_of )
+        
+        self.w1 = nn.Linear(args.dim, hidden_dim, bias=False)
+        self.w2 = nn.Linear(args.hidden_dim, args.hidden_dim, bias=False)
+        self.w3 = nn.Linear(args.dim, args.hidden_dim, bias=False)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        swish = F.silu(self.w1(x))
+        x_V = self.w3(x)
+        x = swish * self.w2(x_V)
+        x = self.w2(x)
+        
+        return x
+        
 class EncoderBlock(nn.Module):
     
     def __init__(self, args: ModelArgs) -> None:
